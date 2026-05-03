@@ -17,13 +17,13 @@ domain_name         = "app.example.com"
 acm_certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/REPLACE-ME"
 
 # --- ECS ---
-ecs_instance_type    = "t3.large"
-ecs_min_size         = 2
-ecs_max_size         = 8
-ecs_desired_capacity = 3
-container_port       = 8080
-container_cpu        = 512
-container_memory     = 1024
+ecs_instance_type     = "t3.large"
+ecs_min_size          = 2
+ecs_max_size          = 8
+ecs_desired_capacity  = 3
+container_port        = 8080
+container_cpu         = 512
+container_memory      = 1024
 service_desired_count = 3
 
 # --- RDS ---
