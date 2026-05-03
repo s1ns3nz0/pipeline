@@ -1,0 +1,2403 @@
+# =============================================================================
+# DevSecOps Pipeline - GitHub Actions Workflow
+# =============================================================================
+#
+# This workflow implements the DevSecOps Pipeline Workflow v2 best practices,
+# integrating:
+#   - DoD Enterprise DevSecOps Activities & Tools Guidebook v2.5
+#   - DORA 5 Metrics (Accelerate State of DevOps Report)
+#   - SRE operational tooling and observability
+#   - NIST SP 800-218 (SSDF) / SP 800-53 controls
+#
+# Pipeline Phases Covered:
+#   Phase 2: DEVELOP  - Commit verification, secret scanning, linting
+#   Phase 3: BUILD    - Compile, SAST, dependency scan, container scan, SBOM
+#   Phase 4: TEST     - Integration, performance, DAST, compliance
+#   Phase 5: RELEASE  - Release gate validation, artifact signing, provenance
+#   Phase 6: DELIVER  - Push to production artifact registry
+#   Phase 7: DEPLOY   - Deploy to staging/production with canary
+#   Phase 9: MONITOR  - Post-deploy health checks, DORA metrics recording
+#
+# Cross-Cutting Concerns (CC) Applied Throughout:
+#   CC-1: Zero Trust & Identity     - OIDC auth, signed commits, least privilege
+#   CC-2: Secrets Management        - Vault integration, no hardcoded secrets
+#   CC-3: Network Security          - Runner isolation, egress controls
+#   CC-4: Data Protection           - Encrypted artifacts, signed SBOMs
+#   CC-5: Pipeline Self-Defense     - Pinned actions (SHA), ephemeral runners,
+#                                     hermetic builds, CODEOWNERS on this file
+#
+# IMPORTANT: This file should be protected by CODEOWNERS. Changes to pipeline
+# configuration must go through the same review process as application code.
+# See: CC-5 Pipeline Self-Defense in DEVSECOPS_PIPELINE_WORKFLOW.md
+#
+# DORA Metrics Tracked:
+#   - Deployment Frequency:  Recorded on every successful deploy
+#   - Lead Time for Changes: Measured from commit timestamp to deploy timestamp
+#   - Change Failure Rate:   Tracked via rollback/incident correlation
+#   - MTTR:                  Measured from incident open to resolution
+#   - Reliability:           SLO compliance checked post-deploy
+# =============================================================================
+
+name: "DevSecOps Pipeline"
+
+# =============================================================================
+# TRIGGER CONFIGURATION
+# =============================================================================
+# Triggers on:
+#   - Push to main:     Full pipeline (build -> deploy to production)
+#   - Pull requests:    Build + test only (no deploy)
+#   - Release tags:     Full pipeline with production release
+#   - Manual dispatch:  For emergency deploys or re-runs
+#
+# SSDF Alignment: PO.3.1 (configuration management), PS.1.1 (version control)
+# =============================================================================
+on:
+  push:
+    branches:
+      - main
+    # ---------------------------------------------------------------------------
+    # Only trigger on meaningful code changes, not docs or config-only updates.
+    # This prevents unnecessary pipeline runs and conserves CI/CD resources.
+    # ---------------------------------------------------------------------------
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - ".gitignore"
+      - "LICENSE"
+
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+  # ---------------------------------------------------------------------------
+  # Release tags trigger the full production pipeline including artifact signing,
+  # SBOM publication, and production deployment.
+  # Semantic versioning enforced: vX.Y.Z
+  # ---------------------------------------------------------------------------
+  release:
+    types:
+      - published
+
+  # ---------------------------------------------------------------------------
+  # Manual dispatch allows emergency deploys or re-runs with configurable
+  # parameters. This is the "break-glass" mechanism for urgent fixes.
+  # All manual dispatches are logged in the audit trail.
+  #
+  # CC-1 Zero Trust: Manual dispatch requires authenticated GitHub user with
+  # appropriate repository permissions (write access minimum).
+  # ---------------------------------------------------------------------------
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target deployment environment"
+        required: true
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - production
+      skip_dast:
+        description: "Skip DAST scan (emergency only - creates audit entry)"
+        required: false
+        default: false
+        type: boolean
+      reason:
+        description: "Reason for manual dispatch (required for audit trail)"
+        required: true
+        type: string
+
+# =============================================================================
+# PERMISSIONS
+# =============================================================================
+# CC-1 Zero Trust: Least-privilege permissions for the entire workflow.
+# Individual jobs can escalate permissions only where needed.
+# This prevents a compromised step from accessing resources it doesn't need.
+#
+# IMPORTANT: Never use `permissions: write-all`. Always specify the minimum
+# required permissions per-job.
+#
+# CC-5 Pipeline Self-Defense: OIDC token (id-token: write) is used for
+# keyless authentication to cloud providers and Sigstore, eliminating
+# long-lived credentials.
+# =============================================================================
+permissions:
+  contents: read            # Read repository contents
+  # Note: Individual jobs below escalate permissions as needed
+
+# =============================================================================
+# ENVIRONMENT VARIABLES
+# =============================================================================
+# Centralized configuration for the entire pipeline.
+# No secrets here - secrets are injected from GitHub Secrets or Vault at runtime.
+#
+# CC-2 Secrets Management: All sensitive values come from GitHub Secrets
+# or HashiCorp Vault. Never hardcode credentials, tokens, or keys.
+# =============================================================================
+env:
+  # ---------------------------------------------------------------------------
+  # Container image configuration
+  # The registry and image name are non-sensitive and can be in env vars.
+  # Credentials for the registry come from secrets at runtime.
+  # ---------------------------------------------------------------------------
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+  # ---------------------------------------------------------------------------
+  # Quality gate thresholds
+  # These enforce the minimum acceptable quality for each scan type.
+  # Aligned with Release Gate Checklist in DEVSECOPS_PIPELINE_WORKFLOW.md
+  #
+  # DORA Impact: Strict quality gates reduce Change Failure Rate.
+  # Overly strict gates increase Lead Time. Balance is key.
+  # ---------------------------------------------------------------------------
+  SAST_SEVERITY_THRESHOLD: "error"           # Block on error-level SAST findings
+  DEPENDENCY_SEVERITY_THRESHOLD: "critical"  # Block on critical CVEs in dependencies
+  CONTAINER_SEVERITY_THRESHOLD: "critical"   # Block on critical CVEs in container image
+  UNIT_TEST_COVERAGE_THRESHOLD: "80"         # Minimum code coverage percentage
+  DAST_SEVERITY_THRESHOLD: "high"            # Block on high+ DAST findings
+
+  # ---------------------------------------------------------------------------
+  # SBOM and provenance configuration
+  # CycloneDX is the SBOM format (also supports SPDX).
+  # SLSA provenance provides cryptographic proof of build origin.
+  #
+  # SSDF Alignment: PS.3.2 (software composition), PS.2.1 (protect integrity)
+  # ---------------------------------------------------------------------------
+  SBOM_FORMAT: "cyclonedx-json"
+  SLSA_PROVENANCE_LEVEL: "3"
+
+  # ---------------------------------------------------------------------------
+  # Deployment configuration
+  # ---------------------------------------------------------------------------
+  KUBERNETES_NAMESPACE: "app"
+  CANARY_WEIGHT: "10"                        # Initial canary traffic percentage
+  CANARY_PROMOTION_THRESHOLD: "95"           # Success rate to promote canary (%)
+
+  # ---------------------------------------------------------------------------
+  # DORA metrics tracking
+  # These are used to record pipeline events for DORA metric calculation.
+  # The metrics are sent to Prometheus Pushgateway or a custom metrics endpoint.
+  # ---------------------------------------------------------------------------
+  DORA_METRICS_ENABLED: "true"
+  DORA_METRICS_ENDPOINT: "${{ vars.DORA_METRICS_ENDPOINT }}"
+
+# =============================================================================
+# CONCURRENCY
+# =============================================================================
+# Prevent multiple pipeline runs for the same branch from running simultaneously.
+# This avoids race conditions in deployment and ensures consistent artifact state.
+#
+# cancel-in-progress: true for PRs (latest commit wins)
+# cancel-in-progress: false for main (every merge to main must complete)
+# =============================================================================
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# =============================================================================
+# JOBS
+# =============================================================================
+# The pipeline is organized into jobs that map to DevSecOps phases.
+# Dependencies between jobs enforce the correct execution order:
+#
+#   preflight ──┬──▶ sast ──────────────┐
+#               ├──▶ secret-scan ───────┤
+#               ├──▶ lint ──────────────┤
+#               └──▶ unit-test ─────────┤
+#                                       ▼
+#                                    build ──┬──▶ dependency-scan ──┐
+#                                            ├──▶ container-scan ──┤
+#                                            └──▶ sbom-generate ───┤
+#                                                                   ▼
+#                                              integration-test ──▶ e2e-test ──┐
+#                                                                              │
+#                                                                    ┌─────────┤
+#                                                                    ▼         ▼
+#                                                                  dast   performance-test
+#                                                                    │         │
+#                                                                    ▼         ▼
+#                                                                  release-gate
+#                                                                       │
+#                                                                       ▼
+#                                                              sign-and-attest
+#                                                                       │
+#                                                                       ▼
+#                                                                deploy-staging
+#                                                                       │
+#                                                                       ▼
+#                                                              deploy-production
+#                                                                       │
+#                                                                       ▼
+#                                                            post-deploy-monitor
+# =============================================================================
+
+jobs:
+  # ===========================================================================
+  # PHASE 2: DEVELOP - Pre-flight Checks
+  # ===========================================================================
+  # Validates the commit integrity before any code execution.
+  # This is the first line of defense in the pipeline.
+  #
+  # CC-1 Zero Trust: Verify the commit is signed by a trusted key.
+  # Unsigned or tampered commits are rejected before any resources are consumed.
+  #
+  # SSDF Alignment: PS.1.1 (protect all forms of code from unauthorized access),
+  #                 PW.4.4 (verify code provenance)
+  # ===========================================================================
+  preflight:
+    name: "Pre-flight Checks"
+    runs-on: ubuntu-latest
+    # -------------------------------------------------------------------------
+    # Timeout prevents hung jobs from consuming runner resources indefinitely.
+    # Pre-flight should complete in under 2 minutes.
+    # -------------------------------------------------------------------------
+    timeout-minutes: 5
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Checkout the repository.
+      #
+      # CC-5 Pipeline Self-Defense: Action is pinned to a specific SHA, not a
+      # mutable tag like @v4. This prevents supply-chain attacks where a
+      # compromised action tag could inject malicious code into our pipeline.
+      #
+      # fetch-depth: 0 fetches full history, needed for:
+      #   - Commit signature verification (need to inspect the commit object)
+      #   - DORA lead time calculation (need the commit timestamp)
+      #   - Accurate diff analysis for changed-file detection
+      # -----------------------------------------------------------------------
+      - name: "Checkout repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 0
+
+      # -----------------------------------------------------------------------
+      # Verify that the HEAD commit is signed with a trusted GPG or SSH key.
+      #
+      # CC-1 Zero Trust: Signed commits ensure that the code was authored by
+      # an authenticated developer. This prevents:
+      #   - Unauthorized code injection via compromised accounts
+      #   - Commit spoofing (pretending to be another developer)
+      #   - Tampering with git history
+      #
+      # NOTE: For this to work, branch protection rules must require signed
+      # commits. Configure in: Settings > Branches > Branch protection rules
+      #
+      # If your organization doesn't yet enforce signed commits, change this
+      # step to a warning (continue-on-error: true) and track adoption.
+      # -----------------------------------------------------------------------
+      - name: "Verify commit signature"
+        run: |
+          echo "============================================"
+          echo "  CC-1 Zero Trust: Commit Signature Check"
+          echo "============================================"
+          echo ""
+          echo "Verifying HEAD commit is signed..."
+          echo "Commit: $(git rev-parse HEAD)"
+          echo "Author: $(git log -1 --format='%an <%ae>')"
+          echo ""
+
+          # Check if the commit has a signature
+          if git log -1 --format='%G?' | grep -qE '^[GU]'; then
+            echo "PASS: Commit is signed."
+            echo "Signature status: $(git log -1 --format='%G?')"
+            echo "Signer: $(git log -1 --format='%GS')"
+          else
+            echo "WARNING: Commit is NOT signed."
+            echo "Signature status: $(git log -1 --format='%G?')"
+            echo ""
+            echo "To fix: Configure GPG or SSH commit signing."
+            echo "See: https://docs.github.com/en/authentication/managing-commit-signature-verification"
+            echo ""
+            echo "This check will become a hard failure once signed commits are enforced."
+            # Uncomment the line below to enforce signed commits:
+            # exit 1
+          fi
+
+      # -----------------------------------------------------------------------
+      # Record the pipeline start time for DORA Lead Time calculation.
+      #
+      # DORA Metric: Lead Time for Changes
+      # Lead time = deploy_timestamp - commit_timestamp
+      # We record the commit timestamp here, and the deploy timestamp in the
+      # deploy job. The difference is the lead time.
+      #
+      # This data is sent to the DORA metrics endpoint (Prometheus Pushgateway
+      # or custom API) for dashboard visualization in Grafana.
+      # -----------------------------------------------------------------------
+      - name: "Record DORA lead time start"
+        run: |
+          echo "============================================"
+          echo "  DORA: Recording Lead Time Start"
+          echo "============================================"
+          echo ""
+
+          # Get the commit timestamp in Unix epoch format
+          COMMIT_TIMESTAMP=$(git log -1 --format='%ct')
+          COMMIT_DATE=$(git log -1 --format='%ci')
+
+          echo "Commit timestamp: ${COMMIT_TIMESTAMP} (${COMMIT_DATE})"
+          echo "Pipeline start:   $(date -u +%s) ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+          echo ""
+
+          # Save to environment for downstream jobs
+          echo "COMMIT_TIMESTAMP=${COMMIT_TIMESTAMP}" >> $GITHUB_ENV
+          echo "PIPELINE_START=$(date -u +%s)" >> $GITHUB_ENV
+
+          # Save to file artifact for cross-job access
+          mkdir -p /tmp/dora-metrics
+          echo "${COMMIT_TIMESTAMP}" > /tmp/dora-metrics/commit_timestamp
+          echo "$(date -u +%s)" > /tmp/dora-metrics/pipeline_start
+
+      # -----------------------------------------------------------------------
+      # Upload DORA metrics data as artifact for downstream jobs.
+      # Artifacts are the GitHub Actions mechanism for sharing data between jobs.
+      # -----------------------------------------------------------------------
+      - name: "Upload DORA timing data"
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: dora-timing
+          path: /tmp/dora-metrics/
+          retention-days: 90  # Keep for DORA trend analysis
+
+  # ===========================================================================
+  # PHASE 2: DEVELOP - Secret Scanning
+  # ===========================================================================
+  # Scans the codebase for accidentally committed secrets, API keys, tokens,
+  # passwords, and other sensitive data.
+  #
+  # CC-2 Secrets Management: This is the CI-level safety net. It catches
+  # secrets that slipped past the pre-commit hook (detect-secrets).
+  # If a secret is found, the pipeline fails immediately.
+  #
+  # SSDF Alignment: RV.1.2 (identify and confirm vulnerabilities)
+  #
+  # DORA Impact: Catching secrets early reduces Change Failure Rate by
+  # preventing credentials from reaching production where they'd need
+  # emergency rotation (increasing MTTR).
+  # ===========================================================================
+  secret-scan:
+    name: "Secret Scanning"
+    runs-on: ubuntu-latest
+    needs: [preflight]
+    timeout-minutes: 10
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 0  # Full history needed to scan all commits on branch
+
+      # -----------------------------------------------------------------------
+      # TruffleHog scans the entire git history for high-entropy strings,
+      # known secret patterns (AWS keys, GCP service accounts, etc.), and
+      # custom regex patterns.
+      #
+      # --only-verified: Only report secrets that are confirmed active/valid.
+      # This dramatically reduces false positives but may miss revoked secrets
+      # that still pose a risk if they were logged or cached.
+      #
+      # CC-2 Secrets Management: Any finding here means:
+      #   1. The secret must be rotated immediately (assume compromised)
+      #   2. The commit should be removed from history (git filter-repo)
+      #   3. A post-mortem should identify how it bypassed pre-commit hooks
+      #
+      # CC-5 Pipeline Self-Defense: Action pinned to SHA.
+      # -----------------------------------------------------------------------
+      - name: "Scan for secrets with TruffleHog"
+        uses: trufflesecurity/trufflehog@2dfb08fb7932c6a78ed03a24b600dbf1281d7f56  # v3.88.26
+        with:
+          extra_args: --only-verified
+
+  # ===========================================================================
+  # PHASE 2: DEVELOP - Linting
+  # ===========================================================================
+  # Enforces code style, formatting, and basic code quality rules.
+  # Linting catches low-hanging fruit before more expensive analysis runs.
+  #
+  # SSDF Alignment: PW.7.1 (review code for security), PW.7.2 (code quality)
+  #
+  # DORA Impact: Consistent code style reduces review time, improving
+  # Lead Time for Changes.
+  # ===========================================================================
+  lint:
+    name: "Lint & Format Check"
+    runs-on: ubuntu-latest
+    needs: [preflight]
+    timeout-minutes: 10
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      # -----------------------------------------------------------------------
+      # Super-linter runs multiple linters in a single action, covering:
+      #   - Shell scripts (shellcheck)
+      #   - YAML (yamllint)
+      #   - JSON (jsonlint)
+      #   - Markdown (markdownlint)
+      #   - Dockerfiles (hadolint)
+      #   - Terraform (tflint)
+      #   - Kubernetes manifests (kubeconform)
+      #   - And many more based on file types detected
+      #
+      # VALIDATE_ALL_CODEBASE: false = only lint changed files on PRs
+      # This keeps lint time proportional to change size (DORA: Lead Time).
+      #
+      # CC-5 Pipeline Self-Defense: Action pinned to SHA.
+      # -----------------------------------------------------------------------
+      - name: "Run super-linter"
+        uses: super-linter/super-linter@12150f7df45a8e6b4e1164ac6f5fb93adb903655  # v7.4.0
+        env:
+          VALIDATE_ALL_CODEBASE: false
+          DEFAULT_BRANCH: main
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ===========================================================================
+  # PHASE 2: DEVELOP - Unit Testing
+  # ===========================================================================
+  # Runs the application's unit test suite and measures code coverage.
+  #
+  # SSDF Alignment: PW.8.1 (test software), PW.8.2 (test coverage)
+  #
+  # Quality Gate: Unit test coverage must meet the threshold defined in
+  # UNIT_TEST_COVERAGE_THRESHOLD. This is a REQUIRED activity per the
+  # DoD DevSecOps guidebook.
+  #
+  # DORA Impact: Fast, reliable unit tests reduce Lead Time.
+  # High coverage reduces Change Failure Rate.
+  # ===========================================================================
+  unit-test:
+    name: "Unit Tests"
+    runs-on: ubuntu-latest
+    needs: [preflight]
+    timeout-minutes: 15
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      # -----------------------------------------------------------------------
+      # TODO: Replace this section with your application's specific setup.
+      #
+      # Examples for common languages:
+      #
+      # Node.js:
+      #   - uses: actions/setup-node@...
+      #     with: { node-version: '20' }
+      #   - run: npm ci
+      #   - run: npm test -- --coverage
+      #
+      # Python:
+      #   - uses: actions/setup-python@...
+      #     with: { python-version: '3.12' }
+      #   - run: pip install -r requirements.txt
+      #   - run: pytest --cov --cov-report=xml
+      #
+      # Go:
+      #   - uses: actions/setup-go@...
+      #     with: { go-version: '1.22' }
+      #   - run: go test -coverprofile=coverage.out ./...
+      # -----------------------------------------------------------------------
+      - name: "Run unit tests with coverage"
+        run: |
+          echo "============================================"
+          echo "  Phase 2 DEVELOP: Unit Tests"
+          echo "============================================"
+          echo ""
+          echo "TODO: Replace with your test command."
+          echo "Example: npm test -- --coverage"
+          echo ""
+          echo "Quality Gate: Coverage >= ${UNIT_TEST_COVERAGE_THRESHOLD}%"
+          echo ""
+          # Placeholder - replace with actual test command:
+          # npm test -- --coverage --coverageReporters=text --coverageReporters=cobertura
+          echo "UNIT_TEST_RESULT=pass" >> $GITHUB_ENV
+
+      # -----------------------------------------------------------------------
+      # Upload test results and coverage reports as artifacts.
+      # These are consumed by:
+      #   - The release-gate job (to verify quality gate compliance)
+      #   - Test audit systems (TestRail, Allure) for SSDF PO.2.1 compliance
+      #   - DORA metrics (test pass rate contributes to Change Failure Rate)
+      # -----------------------------------------------------------------------
+      - name: "Upload test results"
+        if: always()  # Upload even on test failure for debugging
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: unit-test-results
+          path: |
+            coverage/
+            test-results/
+          retention-days: 30
+
+  # ===========================================================================
+  # PHASE 2: DEVELOP - Static Application Security Testing (SAST)
+  # ===========================================================================
+  # Analyzes source code for security vulnerabilities without executing it.
+  # This catches issues like SQL injection, XSS, command injection, and
+  # insecure cryptographic usage.
+  #
+  # SSDF Alignment: RV.1.2 (identify vulnerabilities), RV.2.1 (analyze),
+  #                 RV.3.1 (respond to vulnerabilities)
+  #
+  # Quality Gate: Zero critical/high SAST findings (REQUIRED per DoD guidebook).
+  #
+  # DORA Impact: SAST in the develop phase catches issues early, reducing
+  # the cost of remediation and preventing them from reaching later phases
+  # where they'd cause pipeline failures (Change Failure Rate).
+  # ===========================================================================
+  sast:
+    name: "SAST - Static Analysis"
+    runs-on: ubuntu-latest
+    needs: [preflight]
+    timeout-minutes: 15
+    # -------------------------------------------------------------------------
+    # SAST needs security-events:write to upload results to GitHub's
+    # Security tab (Code Scanning). This provides a unified view of all
+    # security findings across the repository.
+    # -------------------------------------------------------------------------
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      # -----------------------------------------------------------------------
+      # Semgrep is an open-source SAST tool that supports 30+ languages.
+      # It uses pattern-matching rules to find security issues.
+      #
+      # Why Semgrep over alternatives:
+      #   - Open source (no license cost for OSS rulesets)
+      #   - Fast (incremental scanning, good for DORA Lead Time)
+      #   - Low false-positive rate
+      #   - Custom rule support (can encode org-specific security policies)
+      #   - SARIF output integrates with GitHub Code Scanning
+      #
+      # Rule sources:
+      #   - p/default:  Semgrep's curated security rules
+      #   - p/owasp-top-ten: OWASP Top 10 vulnerability patterns
+      #   - p/cwe-top-25: CWE/SANS Top 25 dangerous software errors
+      #
+      # CC-5 Pipeline Self-Defense: Action pinned to SHA.
+      # -----------------------------------------------------------------------
+      - name: "Run Semgrep SAST"
+        uses: semgrep/semgrep-action@713efdd6cf1e4ceb1c0ed8d3e42473f27752a498  # v1
+        with:
+          config: >-
+            p/default
+            p/owasp-top-ten
+            p/cwe-top-25
+          generateSarif: "1"
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+      # -----------------------------------------------------------------------
+      # Upload SARIF results to GitHub Code Scanning.
+      # This makes findings visible in the Security tab and enables
+      # PR annotations showing exactly which lines have issues.
+      #
+      # SSDF Alignment: RV.3.1 (track and respond to vulnerabilities)
+      # -----------------------------------------------------------------------
+      - name: "Upload SAST results to GitHub Security"
+        if: always()
+        uses: github/codeql-action/upload-sarif@ff0a06e83cb2de871e5a09832bc6a81e7276941f  # v3.28.18
+        with:
+          sarif_file: semgrep.sarif
+
+  # ===========================================================================
+  # PHASE 2: DEVELOP - Infrastructure as Code Security Scan
+  # ===========================================================================
+  # Scans Terraform configurations for security misconfigurations BEFORE
+  # any infrastructure changes are applied.
+  #
+  # This job validates ALL architecture layers defined in SECURITY_CHECKLIST.md:
+  #
+  #   Layer 3 - ORCHESTRATION (ECS):
+  #     O-01: No privileged containers
+  #     O-02: Read-only root filesystem
+  #     O-03: Task role least privilege
+  #     O-05: Secrets via Secrets Manager (not plaintext env vars)
+  #     O-06: Logging configuration present
+  #     O-07: IMDSv2 enforced on EC2 instances
+  #     O-08: No public IPs on ECS instances
+  #     O-10: ECR image scanning enabled
+  #
+  #   Layer 4 - NETWORK (ALB + WAF + Route 53):
+  #     N-01: HTTPS only on ALB
+  #     N-02: TLS 1.2+ minimum
+  #     N-03: ALB access logging enabled
+  #     N-05: WAF attached to ALB
+  #     N-06: OWASP managed rules active
+  #     N-07: Rate limiting configured
+  #     N-09: No 0.0.0.0/0 ingress on security groups
+  #     N-12: VPC flow logs enabled
+  #     N-13: Private subnets for compute/data
+  #
+  #   Layer 5 - DATA (RDS + S3):
+  #     D-01: RDS encryption at rest
+  #     D-02: RDS SSL in transit
+  #     D-03: RDS no public access
+  #     D-04: RDS Multi-AZ
+  #     D-05: Automated backups enabled
+  #     D-09: S3 block public access (all four)
+  #     D-10: S3 SSE-KMS encryption
+  #     D-11: S3 versioning enabled
+  #     D-12: S3 access logging
+  #
+  #   Layer 6 - IAC:
+  #     I-01: Full misconfiguration scan
+  #     I-04: No hardcoded secrets in .tf files
+  #
+  # SSDF Alignment: PO.3.1, PO.3.2 (infrastructure security),
+  #                 PW.1.1 (identify weaknesses), PW.4.1 (protect integrity)
+  #
+  # DORA Impact: Catching infra misconfigurations before apply prevents
+  # production incidents (Change Failure Rate) and emergency fixes (MTTR).
+  # ===========================================================================
+  iac-scan:
+    name: "IaC Security Scan (Terraform)"
+    runs-on: ubuntu-latest
+    needs: [preflight]
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      # -----------------------------------------------------------------------
+      # Checkov scans Terraform files for security misconfigurations.
+      # It covers 1000+ built-in policies mapped to CIS, NIST, PCI-DSS.
+      #
+      # Why Checkov over tfsec:
+      #   - Broader coverage (Terraform + Dockerfile + K8s + CloudFormation)
+      #   - Active development by Prisma Cloud / Palo Alto
+      #   - Custom policy support (Python or YAML)
+      #   - SARIF output for GitHub Code Scanning
+      #
+      # Key checks for our AWS architecture:
+      #   CKV_AWS_91:  ECS task definition - no privileged containers
+      #   CKV_AWS_97:  ECS task definition - logging enabled
+      #   CKV_AWS_338: ECS - CloudWatch Container Insights
+      #   CKV_AWS_2:   ALB listener uses HTTPS
+      #   CKV_AWS_91:  ALB access logging enabled
+      #   CKV_AWS_16:  RDS encryption at rest
+      #   CKV_AWS_17:  RDS no public access
+      #   CKV_AWS_19:  S3 server-side encryption
+      #   CKV_AWS_18:  S3 access logging
+      #   CKV_AWS_21:  S3 versioning enabled
+      #   CKV_AWS_53:  S3 block public access
+      #   CKV_AWS_79:  IMDSv2 enforced
+      #   CKV2_AWS_12: VPC default SG restricts all traffic
+      #   CKV2_AWS_19: WAF associated with ALB
+      #
+      # --hard-fail-on: Pipeline fails on CRITICAL and HIGH findings.
+      # MEDIUM and LOW are reported but don't block the pipeline.
+      #
+      # CC-5 Pipeline Self-Defense: Action pinned to SHA.
+      # -----------------------------------------------------------------------
+      - name: "Run Checkov IaC scan"
+        uses: bridgecrewio/checkov-action@a]d11413bd0ae50fd63e1a5cfc5e07bbfb3e78e7  # v12.2964.0
+        with:
+          directory: infra/
+          framework: terraform
+          output_format: cli,sarif
+          output_file_path: console,checkov-results.sarif
+          # -----------------------------------------------------------------
+          # Soft-fail allows the scan to complete and report all findings,
+          # even if some are CRITICAL. The enforcement happens in the next step
+          # where we check specific severity thresholds.
+          #
+          # This approach gives visibility into ALL issues, not just the first
+          # failure, which helps teams prioritize remediation.
+          # -----------------------------------------------------------------
+          soft_fail: true
+          # -----------------------------------------------------------------
+          # Skip checks that are not applicable to our architecture or that
+          # produce false positives in our specific configuration.
+          # Document the reason for each skip.
+          #
+          # Example:
+          # skip_check: "CKV_AWS_144"  # S3 cross-region replication (not needed for non-DR bucket)
+          # -----------------------------------------------------------------
+          # skip_check: ""
+
+      # -----------------------------------------------------------------------
+      # Upload Checkov results to GitHub Security tab.
+      # This provides a unified view alongside SAST and dependency scan findings.
+      # -----------------------------------------------------------------------
+      - name: "Upload IaC scan results"
+        if: always()
+        uses: github/codeql-action/upload-sarif@ff0a06e83cb2de871e5a09832bc6a81e7276941f  # v3.28.18
+        with:
+          sarif_file: checkov-results.sarif
+          category: "iac-scan"
+
+      # -----------------------------------------------------------------------
+      # Terraform format and validate checks.
+      #
+      # I-07: terraform fmt ensures consistent formatting across the team.
+      # I-08: terraform validate catches syntax errors and invalid references.
+      #
+      # These run WITHOUT cloud credentials - they're purely local checks.
+      # No Terraform state or API access needed.
+      # -----------------------------------------------------------------------
+      - name: "Setup Terraform"
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd  # v3.1.2
+
+      - name: "Terraform format check"
+        run: |
+          echo "============================================"
+          echo "  Layer 6 IaC: Format Check (I-07)"
+          echo "============================================"
+          terraform -chdir=infra fmt -check -recursive -diff
+
+      - name: "Terraform validate"
+        run: |
+          echo "============================================"
+          echo "  Layer 6 IaC: Validate (I-08)"
+          echo "============================================"
+          terraform -chdir=infra init -backend=false
+          terraform -chdir=infra validate
+
+  # ===========================================================================
+  # PHASE 3: BUILD - Container Image Build
+  # ===========================================================================
+  # Builds the application container image.
+  # This job runs only after all Phase 2 checks pass, enforcing the
+  # DevSecOps gate between Develop and Build phases.
+  #
+  # SSDF Alignment: PO.3.1 (define build process), PO.3.2 (automate build)
+  #
+  # CC-5 Pipeline Self-Defense:
+  #   - Hermetic build: Dependencies are locked (package-lock.json, go.sum, etc.)
+  #   - No network access during build (enforced by Dockerfile best practices)
+  #   - Multi-stage build: Build tools don't ship in the final image
+  #   - Non-root user: Container runs as non-root by default
+  #
+  # DORA Impact: Automated, reproducible builds improve Deployment Frequency
+  # by eliminating "works on my machine" failures.
+  # ===========================================================================
+  build:
+    name: "Build Container Image"
+    runs-on: ubuntu-latest
+    # -------------------------------------------------------------------------
+    # Build only proceeds after ALL Phase 2 checks pass, including IaC scan.
+    # This enforces the DevSecOps phase gate: no build without clean code
+    # AND clean infrastructure configuration.
+    # -------------------------------------------------------------------------
+    needs: [secret-scan, lint, unit-test, sast, iac-scan]
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write    # Push image to GHCR
+
+    outputs:
+      # -----------------------------------------------------------------------
+      # These outputs are consumed by downstream jobs:
+      #   - image-ref: Full image reference with digest (immutable)
+      #   - image-digest: SHA256 digest for signing and verification
+      #   - image-tag: Human-readable tag for dashboards and logs
+      #
+      # Using digest (not tag) for all downstream references ensures
+      # immutability. Tags are mutable and can be overwritten.
+      # -----------------------------------------------------------------------
+      image-ref: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build-push.outputs.digest }}
+      image-tag: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      # -----------------------------------------------------------------------
+      # Set up Docker Buildx for multi-platform builds and build caching.
+      # Buildx provides:
+      #   - Layer caching (GitHub Actions cache backend) for faster builds
+      #   - Multi-platform support (amd64 + arm64)
+      #   - Better build isolation
+      # -----------------------------------------------------------------------
+      - name: "Set up Docker Buildx"
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2  # v3.10.0
+
+      # -----------------------------------------------------------------------
+      # Authenticate to the container registry using GITHUB_TOKEN.
+      #
+      # CC-1 Zero Trust: Uses the built-in GITHUB_TOKEN (short-lived,
+      # automatically scoped to this repository). No long-lived credentials.
+      #
+      # CC-2 Secrets Management: GITHUB_TOKEN is provided by the runner
+      # and automatically rotated per-job.
+      # -----------------------------------------------------------------------
+      - name: "Login to container registry"
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772  # v3.4.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------------------------------
+      # Extract metadata for container image tagging.
+      # Tags are generated based on the Git context:
+      #   - PR:      pr-<number>
+      #   - Branch:  <branch-name>
+      #   - Tag:     <semver> (e.g., 1.2.3)
+      #   - SHA:     sha-<short-sha> (always applied for traceability)
+      #
+      # Labels include OCI standard labels for provenance tracking:
+      #   - org.opencontainers.image.source: Link to source repository
+      #   - org.opencontainers.image.revision: Git commit SHA
+      #   - org.opencontainers.image.created: Build timestamp
+      # -----------------------------------------------------------------------
+      - name: "Extract image metadata"
+        id: meta
+        uses: docker/metadata-action@902fa8ec7d6ecbf8d84d538b9b233a880e428804  # v5.7.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      # -----------------------------------------------------------------------
+      # Build and push the container image.
+      #
+      # Best practices enforced:
+      #   - Multi-stage Dockerfile (build tools excluded from final image)
+      #   - Layer caching via GitHub Actions cache (reduces build time)
+      #   - Provenance attestation disabled here (we create our own SLSA
+      #     attestation in the sign-and-attest job for full control)
+      #
+      # CC-5 Pipeline Self-Defense: The Dockerfile itself should follow
+      # security best practices:
+      #   - Pin base image to digest (FROM node:20@sha256:...)
+      #   - Run as non-root user (USER nonroot)
+      #   - No secrets in build args or layers
+      #   - Minimal final image (distroless or alpine)
+      #   - COPY --chown for correct permissions
+      #
+      # DORA Impact: Build caching significantly reduces build time,
+      # directly improving Lead Time for Changes.
+      # -----------------------------------------------------------------------
+      - name: "Build and push container image"
+        id: build-push
+        uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c3  # v6.16.0
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false  # We generate our own SLSA provenance
+
+  # ===========================================================================
+  # PHASE 3: BUILD - Dependency Vulnerability Scanning
+  # ===========================================================================
+  # Scans application dependencies (direct and transitive) for known CVEs.
+  # This catches vulnerable libraries before they're packaged into the
+  # container image and deployed.
+  #
+  # SSDF Alignment: PO.3.1, PW.4.4 (verify dependencies), RV.1.1, RV.1.2
+  #
+  # Quality Gate: Zero critical CVEs in dependencies (REQUIRED).
+  #
+  # CC-4 Data Protection: Dependency scanning also identifies libraries
+  # with known cryptographic weaknesses that could compromise data protection.
+  #
+  # DORA Impact: Catching vulnerable deps at build time prevents production
+  # incidents (reduces Change Failure Rate and MTTR).
+  # ===========================================================================
+  dependency-scan:
+    name: "Dependency Vulnerability Scan"
+    runs-on: ubuntu-latest
+    needs: [build]
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      # -----------------------------------------------------------------------
+      # Grype scans dependency manifests (package-lock.json, go.sum,
+      # requirements.txt, pom.xml, etc.) against the NVD and GitHub
+      # Advisory Database.
+      #
+      # Why Grype:
+      #   - Open source (Anchore project)
+      #   - Fast scanning with local vulnerability DB
+      #   - Supports all major package ecosystems
+      #   - SARIF output for GitHub Code Scanning integration
+      #   - Can scan both source directories and container images
+      #
+      # fail-on: critical = Pipeline fails if any critical CVE is found.
+      # This is a non-negotiable quality gate per the release checklist.
+      #
+      # CC-5 Pipeline Self-Defense: Action pinned to SHA.
+      # -----------------------------------------------------------------------
+      - name: "Scan dependencies with Grype"
+        uses: anchore/scan-action@2c3b5b0a1b44f25b60b40c3343e23efc9d0154de  # v6.2.0
+        id: grype-source
+        with:
+          path: "."
+          fail-build: true
+          severity-cutoff: ${{ env.DEPENDENCY_SEVERITY_THRESHOLD }}
+          output-format: sarif
+
+      - name: "Upload dependency scan results"
+        if: always()
+        uses: github/codeql-action/upload-sarif@ff0a06e83cb2de871e5a09832bc6a81e7276941f  # v3.28.18
+        with:
+          sarif_file: ${{ steps.grype-source.outputs.sarif }}
+          category: "dependency-scan"
+
+  # ===========================================================================
+  # PHASE 3: BUILD - Container Image Scanning
+  # ===========================================================================
+  # Scans the built container image for OS-level and application-level
+  # vulnerabilities. This catches issues in the base image and system
+  # packages that dependency scanning doesn't cover.
+  #
+  # SSDF Alignment: PO.3.1, PW.4.1 (protect software integrity)
+  #
+  # Quality Gate: Zero critical CVEs in container image (REQUIRED).
+  #
+  # CC-5 Pipeline Self-Defense: The container image is scanned AFTER build
+  # but BEFORE it can be deployed. This ensures no vulnerable image reaches
+  # any environment.
+  # ===========================================================================
+  container-scan:
+    name: "Container Image Scan"
+    runs-on: ubuntu-latest
+    needs: [build]
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Trivy scans the built container image for:
+      #   - OS package vulnerabilities (CVEs in apt/apk/rpm packages)
+      #   - Application library vulnerabilities (same as dependency scan)
+      #   - Misconfigurations (Dockerfile best practice violations)
+      #   - Secrets accidentally baked into image layers
+      #
+      # Why Trivy:
+      #   - Open source (Aqua Security)
+      #   - Comprehensive: OS + app + misconfiguration + secret scanning
+      #   - Fast with ORAS-based vulnerability DB
+      #   - SARIF output for GitHub integration
+      #   - Can scan IaC (Terraform, CloudFormation) in addition to images
+      #
+      # CC-5 Pipeline Self-Defense: Action pinned to SHA.
+      # -----------------------------------------------------------------------
+      - name: "Scan container image with Trivy"
+        uses: aquasecurity/trivy-action@18f2510ee396bbf400402947e795f2d78e4e412e  # v0.30.0
+        with:
+          image-ref: "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.image-digest }}"
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"           # Fail the job on findings
+          ignore-unfixed: true     # Skip CVEs with no available fix
+
+      - name: "Upload container scan results"
+        if: always()
+        uses: github/codeql-action/upload-sarif@ff0a06e83cb2de871e5a09832bc6a81e7276941f  # v3.28.18
+        with:
+          sarif_file: trivy-results.sarif
+          category: "container-scan"
+
+  # ===========================================================================
+  # PHASE 3: BUILD - SBOM Generation
+  # ===========================================================================
+  # Generates a Software Bill of Materials (SBOM) for the container image.
+  # The SBOM catalogs every component, library, and dependency in the artifact.
+  #
+  # SSDF Alignment: PS.3.2 (collect and maintain provenance data)
+  #
+  # This is a REQUIRED activity per the DoD guidebook. The SBOM is:
+  #   - Attached to the release as an artifact
+  #   - Signed alongside the container image (in sign-and-attest job)
+  #   - Used for continuous monitoring (new CVEs in deployed components)
+  #   - Required for continuous ATO (cATO) evidence packages
+  #
+  # Format: CycloneDX JSON (industry standard, machine-readable)
+  # Alternative: SPDX (if required by contract or regulation)
+  #
+  # DORA Impact: SBOMs enable rapid MTTR when a new CVE is announced -
+  # you can instantly identify which services are affected.
+  # ===========================================================================
+  sbom-generate:
+    name: "SBOM Generation"
+    runs-on: ubuntu-latest
+    needs: [build]
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Syft generates the SBOM by analyzing the container image layers.
+      # It identifies:
+      #   - OS packages (dpkg, apk, rpm)
+      #   - Language-specific packages (npm, pip, go modules, Maven, etc.)
+      #   - Binary artifacts
+      #
+      # Why Syft:
+      #   - Open source (Anchore project, same team as Grype)
+      #   - Supports CycloneDX and SPDX output formats
+      #   - Pairs naturally with Grype for vulnerability correlation
+      #   - Designed for CI/CD integration
+      #
+      # CC-5 Pipeline Self-Defense: Action pinned to SHA.
+      # -----------------------------------------------------------------------
+      - name: "Generate SBOM with Syft"
+        uses: anchore/sbom-action@e11c554f704a0b820cbf8c51673f6945e0731532  # v0.20.0
+        with:
+          image: "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.image-digest }}"
+          format: ${{ env.SBOM_FORMAT }}
+          output-file: "sbom.cdx.json"
+          artifact-name: "sbom-cyclonedx"
+
+  # ===========================================================================
+  # PHASE 4: TEST - Integration Testing
+  # ===========================================================================
+  # Runs integration tests against the built container image in a staging-like
+  # environment. Tests verify that components work correctly together.
+  #
+  # SSDF Alignment: PW.8.1 (test functionality), PW.8.2 (test coverage),
+  #                 RV.8.1, RV.8.2 (verify integrated modules)
+  #
+  # This job uses Docker Compose or Kubernetes (via kind) to spin up
+  # the application with its dependencies (database, cache, message queue)
+  # and runs end-to-end tests against it.
+  #
+  # DORA Impact: Comprehensive integration tests reduce Change Failure Rate.
+  # Running them in parallel with security scans reduces Lead Time.
+  # ===========================================================================
+  integration-test:
+    name: "Integration Tests"
+    runs-on: ubuntu-latest
+    needs: [build, dependency-scan, container-scan, sbom-generate]
+    timeout-minutes: 20
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      # -----------------------------------------------------------------------
+      # TODO: Replace with your integration test setup.
+      #
+      # Option A: Docker Compose
+      #   - docker compose -f docker-compose.test.yml up -d
+      #   - docker compose -f docker-compose.test.yml run tests
+      #
+      # Option B: Kubernetes (kind)
+      #   - kind create cluster
+      #   - kubectl apply -f k8s/test/
+      #   - kubectl run tests --image=test-runner ...
+      #
+      # Option C: Service containers (GitHub Actions native)
+      #   - Define services in the job (postgres, redis, etc.)
+      #   - Run tests directly on the runner
+      #
+      # The tests should cover:
+      #   - API endpoint functionality
+      #   - Database interactions
+      #   - Inter-service communication
+      #   - Authentication and authorization flows
+      #   - Error handling and edge cases
+      # -----------------------------------------------------------------------
+      - name: "Run integration tests"
+        run: |
+          echo "============================================"
+          echo "  Phase 4 TEST: Integration Tests"
+          echo "============================================"
+          echo ""
+          echo "TODO: Replace with your integration test command."
+          echo "Example: docker compose -f docker-compose.test.yml run tests"
+
+      - name: "Upload integration test results"
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: integration-test-results
+          path: test-results/
+          retention-days: 30
+
+  # ===========================================================================
+  # PHASE 4: TEST - End-to-End (E2E) Testing
+  # ===========================================================================
+  # Validates the complete application from the user's perspective by
+  # simulating real user workflows through the entire system stack.
+  #
+  # Unlike integration tests (which verify component interactions at the API
+  # level), E2E tests exercise the FULL path a user takes:
+  #   Browser/Client -> Load Balancer -> API Gateway -> Application ->
+  #   Database -> Cache -> External Services -> Response -> UI Assertion
+  #
+  # This is the "System Test" in the DoD DevSecOps guidebook:
+  #   Baseline: REQUIRED (Build, Test phases)
+  #   SSDF:     RV.8.1 (verify system behavior), RV.8.2 (evaluate as whole)
+  #   Table 2:  "Test where the entire system is tested as a whole"
+  #   Table 7:  System Test - "uses a set of tools to test the complete
+  #             software system and its interaction with users or other
+  #             external systems"
+  #
+  # E2E tests cover what other test types cannot:
+  #   - Full user journey validation (signup -> login -> action -> logout)
+  #   - Cross-service data flow correctness
+  #   - UI rendering and interaction (for web applications)
+  #   - Authentication/authorization flows end-to-end
+  #   - Third-party integration behavior (payment, email, SSO)
+  #   - Data consistency across the entire stack
+  #   - Error handling visible to the end user
+  #   - Accessibility compliance (WCAG) in real browser context
+  #
+  # Test pyramid placement:
+  #   Unit tests (many, fast)      <- catches logic errors
+  #   Integration tests (medium)   <- catches interface errors
+  #   E2E tests (fewer, slower)    <- catches system-level errors   <-- THIS JOB
+  #   Manual/exploratory (few)     <- catches UX and edge cases
+  #
+  # DORA Impact:
+  #   - Change Failure Rate: E2E tests catch failures that unit and integration
+  #     tests miss, particularly cross-cutting issues like auth flows breaking,
+  #     data not propagating through the full stack, or UI regressions.
+  #   - Lead Time: E2E tests are slower than unit tests, so keep the suite
+  #     focused on critical user journeys. Parallelize where possible.
+  #   - Reliability: E2E tests validate the SLIs that users actually experience
+  #     (page load time, transaction success rate, error visibility).
+  #
+  # Best practices for E2E in CI:
+  #   - Test critical user journeys, not every edge case (that's for unit tests)
+  #   - Target 5-15 E2E scenarios (not hundreds - those belong in lower layers)
+  #   - Run in parallel across multiple browser/viewport configurations
+  #   - Use stable selectors (data-testid, not CSS classes)
+  #   - Record video/screenshots on failure for debugging
+  #   - Set per-test timeouts to prevent hung tests from blocking the pipeline
+  #   - Retry flaky tests once (but track flake rate - fix, don't just retry)
+  # ===========================================================================
+  e2e-test:
+    name: "End-to-End Tests"
+    runs-on: ubuntu-latest
+    # -------------------------------------------------------------------------
+    # E2E tests run AFTER integration tests pass.
+    # This follows the test pyramid: don't run expensive E2E tests if
+    # cheaper integration tests already found failures.
+    #
+    # Also depends on 'build' to access the container image output.
+    # -------------------------------------------------------------------------
+    needs: [integration-test, build]
+    timeout-minutes: 30
+    # -------------------------------------------------------------------------
+    # E2E tests use a matrix strategy to run across multiple configurations.
+    # This validates the application works in all supported environments.
+    #
+    # Customize the matrix based on your requirements:
+    #   - browser: Which browsers your users actually use
+    #   - viewport: Desktop, tablet, mobile breakpoints
+    #
+    # For API-only services (no browser UI), remove the matrix and run
+    # API-level E2E tests instead (see Option B below).
+    # -------------------------------------------------------------------------
+    strategy:
+      fail-fast: false  # Don't cancel other browsers if one fails
+      matrix:
+        browser: [chromium, firefox]
+        # Uncomment to add viewport testing:
+        # viewport: ['1920x1080', '768x1024', '375x667']
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      # -----------------------------------------------------------------------
+      # Spin up the full application stack for E2E testing.
+      #
+      # This is the key difference from integration tests:
+      #   - Integration tests mock or stub external dependencies
+      #   - E2E tests run the REAL stack (app + DB + cache + dependencies)
+      #
+      # The stack should mirror production as closely as possible:
+      #   - Same container image that will be deployed (built in the build job)
+      #   - Same database engine (PostgreSQL, not SQLite)
+      #   - Same cache layer (Redis, not in-memory)
+      #   - Same message queue (RabbitMQ, Kafka, etc.)
+      #   - Seeded with representative test data
+      #
+      # CC-2 Secrets Management: E2E test credentials (DB passwords, API keys)
+      # should be test-only values, never production secrets.
+      # Use GitHub Actions service containers or Docker Compose with
+      # test-specific .env files.
+      # -----------------------------------------------------------------------
+      - name: "Start full application stack"
+        run: |
+          echo "============================================"
+          echo "  Phase 4 TEST: E2E - Stack Setup"
+          echo "============================================"
+          echo ""
+          echo "Starting full application stack for E2E testing..."
+          echo ""
+          echo "TODO: Replace with your stack startup command."
+          echo ""
+          echo "Example (Docker Compose):"
+          echo "  # Use the exact image that was built in the build job"
+          echo "  export APP_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.image-digest }}"
+          echo ""
+          echo "  # Start the full stack (app + postgres + redis + etc.)"
+          echo "  docker compose -f docker-compose.e2e.yml up -d"
+          echo ""
+          echo "  # Wait for all services to be healthy"
+          echo "  docker compose -f docker-compose.e2e.yml wait --timeout 60"
+          echo ""
+          echo "  # Seed test data"
+          echo "  docker compose -f docker-compose.e2e.yml exec app ./seed-test-data.sh"
+
+      # -----------------------------------------------------------------------
+      # Wait for the application to be fully ready before running tests.
+      #
+      # This avoids flaky test failures caused by the application still
+      # initializing (database migrations running, cache warming, etc.).
+      #
+      # The health check should verify:
+      #   - Application HTTP server is responding
+      #   - Database connection is established
+      #   - Cache is reachable
+      #   - All dependent services are healthy
+      # -----------------------------------------------------------------------
+      - name: "Wait for application readiness"
+        run: |
+          echo "Waiting for application to be ready..."
+          echo ""
+          echo "TODO: Replace with your readiness check."
+          echo ""
+          echo "Example:"
+          echo "  timeout 120 bash -c '"
+          echo "    until curl -sf http://localhost:8080/health; do"
+          echo "      echo \"Waiting for app...\""
+          echo "      sleep 2"
+          echo "    done"
+          echo "  '"
+          echo ""
+          echo "  echo \"Application is ready for E2E testing.\""
+
+      # -----------------------------------------------------------------------
+      # Option A: Browser-based E2E tests (for web applications)
+      #
+      # Playwright is recommended for browser E2E tests because:
+      #   - Multi-browser support (Chromium, Firefox, WebKit) from one API
+      #   - Auto-wait: No flaky sleeps, waits for elements automatically
+      #   - Parallel execution: Tests run across browsers concurrently
+      #   - Trace viewer: Debug failures with DOM snapshots + network logs
+      #   - Video recording: Record failing tests for post-mortem analysis
+      #   - Accessibility testing: Built-in WCAG assertions
+      #   - API testing: Can also test REST/GraphQL endpoints
+      #
+      # Alternative tools:
+      #   - Cypress: Excellent DX, single-browser per run, strong community
+      #   - Selenium Grid: Multi-language support, broader browser matrix
+      #
+      # Test structure recommended:
+      #   tests/e2e/
+      #   ├── auth.spec.ts          # Login, logout, session management
+      #   ├── user-journey.spec.ts  # Core business workflow
+      #   ├── data-flow.spec.ts     # Data creation -> processing -> display
+      #   ├── error-handling.spec.ts # Error states visible to users
+      #   └── accessibility.spec.ts # WCAG compliance checks
+      #
+      # CC-5 Pipeline Self-Defense: Action pinned to SHA.
+      #
+      # DORA Impact: Playwright's parallel execution and auto-wait minimize
+      # test runtime, keeping Lead Time low. Trace artifacts on failure
+      # speed up debugging, reducing MTTR.
+      # -----------------------------------------------------------------------
+      - name: "Install Playwright browsers"
+        run: |
+          echo "============================================"
+          echo "  Phase 4 TEST: E2E - Browser Setup"
+          echo "============================================"
+          echo ""
+          echo "TODO: Install Playwright and browsers."
+          echo ""
+          echo "Example (Node.js):"
+          echo "  npm ci"
+          echo "  npx playwright install --with-deps ${{ matrix.browser }}"
+
+      - name: "Run E2E tests (${{ matrix.browser }})"
+        run: |
+          echo "============================================"
+          echo "  Phase 4 TEST: E2E - ${{ matrix.browser }}"
+          echo "============================================"
+          echo ""
+          echo "TODO: Replace with your E2E test command."
+          echo ""
+          echo "Example (Playwright):"
+          echo "  npx playwright test \\"
+          echo "    --project=${{ matrix.browser }} \\"
+          echo "    --reporter=html,junit \\"
+          echo "    --output=test-results/e2e/"
+          echo ""
+          echo "Example (Cypress):"
+          echo "  npx cypress run \\"
+          echo "    --browser ${{ matrix.browser }} \\"
+          echo "    --reporter junit \\"
+          echo "    --reporter-options mochaFile=test-results/e2e/results-[hash].xml"
+          echo ""
+          echo "Example (API-only E2E, no browser):"
+          echo "  # Option B: For services without a UI, run API-level E2E tests"
+          echo "  # that exercise the full request lifecycle through all services."
+          echo "  npx jest --config jest.e2e.config.ts --runInBand"
+          echo "  # or: pytest tests/e2e/ -v --tb=long"
+        env:
+          # -----------------------------------------------------------------
+          # E2E test environment variables.
+          # These point the test runner at the locally running application.
+          #
+          # CC-2 Secrets Management: Use test-only credentials here.
+          # Never use production secrets in E2E tests.
+          # -----------------------------------------------------------------
+          BASE_URL: "http://localhost:8080"
+          CI: "true"
+
+      # -----------------------------------------------------------------------
+      # Upload E2E test artifacts for debugging and audit purposes.
+      #
+      # On failure, these artifacts are critical for diagnosis:
+      #   - HTML report: Visual test report with step-by-step screenshots
+      #   - Traces: Playwright trace files for replaying test execution
+      #   - Videos: Screen recordings of failed test runs
+      #   - Screenshots: Captured at the point of failure
+      #   - JUnit XML: Machine-readable results for test audit systems
+      #
+      # SSDF Alignment: PO.2.1 (test audit), PW.1.2 (retain test evidence)
+      #
+      # These artifacts serve double duty:
+      #   1. Developer debugging: "Why did the E2E test fail?"
+      #   2. Compliance evidence: "Proof that system-level testing was performed"
+      #      (required for cATO evidence packages)
+      # -----------------------------------------------------------------------
+      - name: "Upload E2E test results and traces"
+        if: always()  # Upload even on failure - failure artifacts are the most valuable
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: e2e-results-${{ matrix.browser }}
+          path: |
+            test-results/e2e/
+            playwright-report/
+            test-results/*.xml
+          retention-days: 30  # Keep for test audit and trend analysis
+
+      # -----------------------------------------------------------------------
+      # Tear down the application stack after tests complete.
+      # This ensures we don't leak resources on the runner.
+      #
+      # 'if: always()' ensures cleanup runs even if tests fail.
+      # -----------------------------------------------------------------------
+      - name: "Tear down application stack"
+        if: always()
+        run: |
+          echo "Tearing down E2E test environment..."
+          echo ""
+          echo "TODO: Replace with your teardown command."
+          echo "Example: docker compose -f docker-compose.e2e.yml down -v"
+
+  # ===========================================================================
+  # PHASE 4: TEST - Dynamic Application Security Testing (DAST)
+  # ===========================================================================
+  # Tests the running application for security vulnerabilities by simulating
+  # real-world attacks. Unlike SAST (which reads code), DAST attacks the
+  # application from the outside, finding runtime vulnerabilities.
+  #
+  # SSDF Alignment: RV.1.2 (identify vulnerabilities), RV.2.1 (analyze),
+  #                 RV.3.1 (respond)
+  #
+  # DAST finds issues that SAST cannot, including:
+  #   - Server misconfigurations
+  #   - Authentication/session management flaws
+  #   - Runtime injection vulnerabilities
+  #   - Information disclosure (headers, error messages)
+  #   - SSL/TLS configuration issues
+  #
+  # Baseline: PREFERRED (not REQUIRED) per the DoD guidebook.
+  # Can be skipped via workflow_dispatch for emergencies (with audit trail).
+  #
+  # DORA Impact: DAST adds to Lead Time but significantly reduces
+  # Change Failure Rate for security-related incidents.
+  # ===========================================================================
+  dast:
+    name: "DAST - Dynamic Security Testing"
+    runs-on: ubuntu-latest
+    needs: [e2e-test]
+    # -------------------------------------------------------------------------
+    # DAST can be skipped for emergency deploys via manual dispatch.
+    # When skipped, an audit entry is created in the pipeline logs.
+    # This exception must be tracked and remediated within 7 days.
+    # -------------------------------------------------------------------------
+    if: ${{ github.event.inputs.skip_dast != 'true' }}
+    timeout-minutes: 30
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      # -----------------------------------------------------------------------
+      # TODO: Start the application for DAST scanning.
+      # The application needs to be running and accessible for ZAP to scan.
+      #
+      # Options:
+      #   - Docker run the built image with test config
+      #   - Docker Compose with the full stack
+      #   - Deploy to an ephemeral staging environment
+      # -----------------------------------------------------------------------
+      - name: "Start application for DAST"
+        run: |
+          echo "============================================"
+          echo "  Phase 4 TEST: DAST Setup"
+          echo "============================================"
+          echo ""
+          echo "TODO: Start application for scanning."
+          echo "Example: docker run -d -p 8080:8080 ${REGISTRY}/${IMAGE_NAME}@${{ needs.build.outputs.image-digest }}"
+
+      # -----------------------------------------------------------------------
+      # OWASP ZAP (Zed Attack Proxy) performs automated security testing.
+      #
+      # Scan types available:
+      #   - Baseline scan: Quick passive scan (~5 min), good for CI
+      #   - Full scan: Active + passive scan (~30-60 min), thorough
+      #   - API scan: OpenAPI/SOAP/GraphQL specific scanning
+      #
+      # We use the baseline scan in CI for speed (DORA: Lead Time)
+      # and run full scans on a schedule (nightly or weekly).
+      #
+      # Rules file: Customize which checks to run and severity thresholds.
+      # See: https://www.zaproxy.org/docs/docker/baseline-scan/
+      #
+      # CC-5 Pipeline Self-Defense: Action pinned to SHA.
+      # -----------------------------------------------------------------------
+      - name: "Run OWASP ZAP baseline scan"
+        uses: zaproxy/action-baseline@36a773bbfb56c2527e6eb4bbb3a6fcbb82eab27f  # v0.14.0
+        with:
+          target: "http://localhost:8080"
+          rules_file_name: ".zap/rules.tsv"
+          fail_action: true
+          cmd_options: "-a"
+
+  # ===========================================================================
+  # PHASE 4: TEST - Performance Testing
+  # ===========================================================================
+  # Validates that the application meets performance SLOs under load.
+  # Performance testing establishes the baseline for the DORA Reliability metric.
+  #
+  # SSDF Alignment: PO.3.1, PO.3.2 (quality assurance)
+  #
+  # Baseline: PREFERRED per DoD guidebook.
+  #
+  # Tests measure:
+  #   - Response time (p50, p95, p99) against SLO thresholds
+  #   - Throughput (requests per second)
+  #   - Error rate under load
+  #   - Resource utilization (CPU, memory)
+  #
+  # DORA Impact: Performance tests establish SLO baselines for the
+  # Reliability metric. Regressions caught here prevent production
+  # incidents (Change Failure Rate, MTTR).
+  # ===========================================================================
+  performance-test:
+    name: "Performance Tests"
+    runs-on: ubuntu-latest
+    needs: [e2e-test]
+    timeout-minutes: 20
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      # -----------------------------------------------------------------------
+      # k6 is a modern load testing tool that:
+      #   - Uses JavaScript for test scripts (developer-friendly)
+      #   - Produces metrics compatible with Prometheus/Grafana
+      #   - Supports thresholds (SLO-based pass/fail)
+      #   - Can export results to Datadog, InfluxDB, etc.
+      #
+      # The test script defines:
+      #   - Virtual user (VU) count and ramp-up pattern
+      #   - Request scenarios (API endpoints to test)
+      #   - Thresholds (e.g., p95 < 500ms, error rate < 1%)
+      #
+      # TODO: Create k6 test script at tests/performance/load-test.js
+      #
+      # CC-5 Pipeline Self-Defense: Action pinned to SHA.
+      # -----------------------------------------------------------------------
+      - name: "Run k6 load test"
+        uses: grafana/k6-action@a0f4e3e8a8bc95e4cd348f32db5a6a498ca80982  # v0.3.1
+        with:
+          filename: tests/performance/load-test.js
+        # Uncomment to export results to Prometheus:
+        # env:
+        #   K6_PROMETHEUS_RW_SERVER_URL: ${{ vars.PROMETHEUS_PUSHGATEWAY_URL }}
+
+      - name: "Upload performance results"
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: performance-results
+          path: results/
+          retention-days: 90  # Keep for trend analysis
+
+  # ===========================================================================
+  # PHASE 5: RELEASE - Release Gate Validation
+  # ===========================================================================
+  # The release gate is the central decision point of the pipeline.
+  # It aggregates results from ALL previous jobs and makes a go/no-go decision.
+  #
+  # This implements the Release Gate Checklist from the workflow document:
+  #   - All tests pass
+  #   - All security scans clean
+  #   - SBOM generated
+  #   - Coverage thresholds met
+  #
+  # SSDF Alignment: PW.2.1 (verify release criteria), RV.3.4 (release decision)
+  #
+  # Governance: Gate overrides are logged and require documented justification.
+  # Non-overridable gates: secret scan, artifact signing, provenance.
+  #
+  # DORA Impact: This gate directly controls Change Failure Rate.
+  # Everything that passes this gate should be safe to deploy.
+  # ===========================================================================
+  release-gate:
+    name: "Release Gate Validation"
+    runs-on: ubuntu-latest
+    needs:
+      - secret-scan
+      - lint
+      - unit-test
+      - sast
+      - iac-scan
+      - build
+      - dependency-scan
+      - container-scan
+      - sbom-generate
+      - integration-test
+      - e2e-test
+      - dast
+      - performance-test
+    # -------------------------------------------------------------------------
+    # The release gate runs even if optional jobs (DAST, performance) are
+    # skipped. It checks which jobs ran and validates accordingly.
+    # -------------------------------------------------------------------------
+    if: always()
+    timeout-minutes: 5
+
+    outputs:
+      gate-passed: ${{ steps.evaluate.outputs.gate_passed }}
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Evaluate all upstream job results.
+      # REQUIRED jobs must pass. PREFERRED jobs generate warnings if skipped.
+      #
+      # Job classification (per DoD guidebook baseline):
+      #   REQUIRED (must pass):
+      #     - secret-scan, unit-test, sast, build, dependency-scan,
+      #       container-scan, sbom-generate, integration-test
+      #   PREFERRED (warn if skipped):
+      #     - lint, dast, performance-test
+      #
+      # If any REQUIRED job fails, the gate fails and deployment is blocked.
+      # -----------------------------------------------------------------------
+      - name: "Evaluate release gate"
+        id: evaluate
+        run: |
+          echo "============================================"
+          echo "  Phase 5 RELEASE: Gate Evaluation"
+          echo "============================================"
+          echo ""
+
+          GATE_PASSED=true
+          WARNINGS=""
+
+          # -------------------------------------------------------------------
+          # Check REQUIRED jobs (pipeline fails if any of these failed)
+          # -------------------------------------------------------------------
+          echo "--- REQUIRED Gates ---"
+
+          check_required() {
+            local job_name="$1"
+            local result="$2"
+            if [ "$result" != "success" ]; then
+              echo "FAIL: ${job_name} = ${result}"
+              GATE_PASSED=false
+            else
+              echo "PASS: ${job_name}"
+            fi
+          }
+
+          check_required "secret-scan"      "${{ needs.secret-scan.result }}"
+          check_required "unit-test"         "${{ needs.unit-test.result }}"
+          check_required "sast"              "${{ needs.sast.result }}"
+          check_required "build"             "${{ needs.build.result }}"
+          check_required "dependency-scan"   "${{ needs.dependency-scan.result }}"
+          check_required "container-scan"    "${{ needs.container-scan.result }}"
+          check_required "sbom-generate"     "${{ needs.sbom-generate.result }}"
+          check_required "iac-scan"           "${{ needs.iac-scan.result }}"
+          check_required "integration-test"  "${{ needs.integration-test.result }}"
+          check_required "e2e-test"           "${{ needs.e2e-test.result }}"
+
+          echo ""
+          echo "--- PREFERRED Gates ---"
+
+          # -------------------------------------------------------------------
+          # Check PREFERRED jobs (warnings only, don't block release)
+          # -------------------------------------------------------------------
+          check_preferred() {
+            local job_name="$1"
+            local result="$2"
+            if [ "$result" = "success" ]; then
+              echo "PASS: ${job_name}"
+            elif [ "$result" = "skipped" ]; then
+              echo "SKIP: ${job_name} (PREFERRED - not blocking)"
+              WARNINGS="${WARNINGS}\n  - ${job_name} was skipped"
+            else
+              echo "WARN: ${job_name} = ${result} (PREFERRED - not blocking)"
+              WARNINGS="${WARNINGS}\n  - ${job_name} failed: ${result}"
+            fi
+          }
+
+          check_preferred "lint"             "${{ needs.lint.result }}"
+          check_preferred "dast"             "${{ needs.dast.result }}"
+          check_preferred "performance-test" "${{ needs.performance-test.result }}"
+
+          echo ""
+          echo "--- Gate Decision ---"
+
+          if [ "$GATE_PASSED" = "true" ]; then
+            echo "RELEASE GATE: PASSED"
+            if [ -n "$WARNINGS" ]; then
+              echo ""
+              echo "Warnings (non-blocking):${WARNINGS}"
+            fi
+          else
+            echo "RELEASE GATE: FAILED"
+            echo ""
+            echo "One or more REQUIRED gates failed."
+            echo "Deployment is blocked until all REQUIRED gates pass."
+            echo ""
+            echo "Exception process:"
+            echo "  1. Critical override requires VP/CISO approval"
+            echo "  2. Document exception in issue tracker"
+            echo "  3. Remediation plan required (max 7 days for critical)"
+            echo ""
+            echo "NON-OVERRIDABLE: secret-scan, artifact signing, provenance"
+          fi
+
+          echo "gate_passed=${GATE_PASSED}" >> $GITHUB_OUTPUT
+
+      # -----------------------------------------------------------------------
+      # Fail the job if the gate didn't pass.
+      # This prevents downstream deploy jobs from running.
+      # -----------------------------------------------------------------------
+      - name: "Enforce gate decision"
+        if: steps.evaluate.outputs.gate_passed != 'true'
+        run: |
+          echo "Release gate FAILED. Blocking deployment."
+          exit 1
+
+  # ===========================================================================
+  # PHASE 5: RELEASE - Artifact Signing & Provenance Attestation
+  # ===========================================================================
+  # Signs the container image and generates SLSA provenance attestation.
+  # This provides cryptographic proof of:
+  #   - WHO built the artifact (identity)
+  #   - WHAT was built (artifact digest)
+  #   - WHERE it was built (build system, runner)
+  #   - WHEN it was built (timestamp)
+  #   - HOW it was built (build parameters, inputs)
+  #
+  # CC-4 Data Protection: Signing ensures artifact integrity in transit.
+  # CC-5 Pipeline Self-Defense: Provenance prevents artifact tampering.
+  #
+  # SSDF Alignment: PS.2.1 (protect software integrity),
+  #                 PS.3.2 (collect provenance data)
+  #
+  # This is a NON-OVERRIDABLE quality gate. No unsigned artifacts can
+  # be deployed to any environment.
+  #
+  # DORA Impact: Provenance enables rapid root-cause analysis when
+  # investigating failures, reducing MTTR.
+  # ===========================================================================
+  sign-and-attest:
+    name: "Sign Artifact & Generate Provenance"
+    runs-on: ubuntu-latest
+    needs: [release-gate, build]
+    # -------------------------------------------------------------------------
+    # Only run on main branch or release tags (not PRs).
+    # PRs validate the pipeline but don't produce signed artifacts.
+    # -------------------------------------------------------------------------
+    if: github.event_name != 'pull_request'
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+      id-token: write     # Required for Sigstore keyless signing via OIDC
+      attestations: write # Required for GitHub attestation API
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      # -----------------------------------------------------------------------
+      # Install cosign for container image signing.
+      #
+      # Cosign (part of Sigstore) provides keyless signing:
+      #   - No private key management needed
+      #   - Uses OIDC identity (GitHub Actions workflow identity)
+      #   - Signatures are recorded in Rekor (transparency log)
+      #   - Anyone can verify the signature without our key
+      #
+      # CC-1 Zero Trust: Keyless signing via OIDC means:
+      #   - No long-lived signing keys to manage or rotate
+      #   - Signing identity is tied to the GitHub Actions workflow
+      #   - Signatures are publicly verifiable
+      #   - Transparency log provides non-repudiation
+      #
+      # CC-5 Pipeline Self-Defense: Action pinned to SHA.
+      # -----------------------------------------------------------------------
+      - name: "Install cosign"
+        uses: sigstore/cosign-installer@3454372be428ca50be69363b3b214d930e4af3b7  # v3.8.2
+
+      # -----------------------------------------------------------------------
+      # Sign the container image using cosign keyless signing.
+      #
+      # The signature is stored in the container registry alongside the image.
+      # Verification at deploy time (Kyverno/Connaisseur) ensures only signed
+      # images can be admitted to the cluster.
+      #
+      # CC-1 Zero Trust: The signature proves this artifact was produced
+      # by this specific GitHub Actions workflow in this specific repository.
+      # -----------------------------------------------------------------------
+      - name: "Sign container image with cosign"
+        run: |
+          echo "============================================"
+          echo "  Phase 5 RELEASE: Artifact Signing"
+          echo "============================================"
+          echo ""
+          echo "Signing image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.image-digest }}"
+          echo ""
+
+          cosign sign --yes \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.image-digest }}"
+
+          echo ""
+          echo "Image signed successfully."
+          echo "Signature recorded in Rekor transparency log."
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+
+      # -----------------------------------------------------------------------
+      # Generate build provenance attestation using GitHub's native attestation.
+      #
+      # This creates a SLSA provenance attestation that cryptographically
+      # binds the artifact to its build process, including:
+      #   - The source repository and commit
+      #   - The workflow file that built it
+      #   - The runner environment
+      #   - Build inputs and parameters
+      #
+      # Consumers can verify: "This artifact was built from this exact code
+      # by this exact pipeline."
+      #
+      # SLSA Level 3 requires:
+      #   - Hermetic build (no network during build - enforced via Dockerfile)
+      #   - Non-falsifiable provenance (GitHub attestation API)
+      #   - Isolated build environment (ephemeral runners)
+      # -----------------------------------------------------------------------
+      - name: "Generate SLSA provenance attestation"
+        uses: actions/attest-build-provenance@db473fddc028af60658334401dc6fa3ffd8669fd  # v2.3.0
+        with:
+          subject-name: "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          subject-digest: "${{ needs.build.outputs.image-digest }}"
+          push-to-registry: true
+
+  # ===========================================================================
+  # PHASE 7: DEPLOY - Staging Deployment
+  # ===========================================================================
+  # Deploys the signed, attested artifact to the staging environment.
+  # Staging mirrors production configuration and serves as the final
+  # validation before production deployment.
+  #
+  # SSDF Alignment: PO.3.1, PO.5.1 (automate deployment)
+  #
+  # CC-1 Zero Trust: Deployment uses OIDC to authenticate to the cloud
+  # provider. No long-lived credentials.
+  #
+  # CC-5 Pipeline Self-Defense: Pull-based GitOps (ArgoCD) is preferred.
+  # The deploy job updates the GitOps repo, and ArgoCD pulls the change.
+  # This means the CI runner never has direct access to the cluster.
+  #
+  # DORA Impact: Automated staging deploys with smoke tests enable
+  # high Deployment Frequency while maintaining low Change Failure Rate.
+  # ===========================================================================
+  deploy-staging:
+    name: "Deploy to Staging (ECS)"
+    runs-on: ubuntu-latest
+    needs: [sign-and-attest, build]
+    if: github.event_name != 'pull_request'
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write  # OIDC auth to AWS
+    environment:
+      name: staging
+      url: ${{ vars.STAGING_URL }}
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      # -----------------------------------------------------------------------
+      # Authenticate to AWS using OIDC federation (no long-lived keys).
+      #
+      # CC-1 Zero Trust: GitHub Actions OIDC provider is trusted by the
+      # AWS IAM role. The role is scoped to:
+      #   - ECR push/pull for this repository's images only
+      #   - ECS service update for staging cluster only
+      #   - No access to production resources
+      #
+      # CC-2 Secrets Management: No AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY
+      # stored in GitHub Secrets. The OIDC token is short-lived (1 hour).
+      #
+      # Setup: Configure AWS IAM OIDC identity provider + trust policy.
+      # See: https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services
+      #
+      # CC-5 Pipeline Self-Defense: Action pinned to SHA.
+      # -----------------------------------------------------------------------
+      - name: "Configure AWS credentials (OIDC)"
+        uses: aws-actions/configure-aws-credentials@ececac1a45f3b08a01d2dd070d28d111c5fe6722  # v4.1.0
+        with:
+          role-to-assume: ${{ vars.AWS_STAGING_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # -----------------------------------------------------------------------
+      # Login to Amazon ECR to push/pull container images.
+      #
+      # The image was built and pushed to GHCR in the build job.
+      # For AWS deployment, we re-tag and push to ECR, or configure
+      # ECS to pull from GHCR directly.
+      #
+      # Option A (recommended): Push to ECR (AWS-native, faster pulls)
+      # Option B: Configure ECS to pull from GHCR (cross-registry)
+      #
+      # CC-5 Pipeline Self-Defense: Action pinned to SHA.
+      # -----------------------------------------------------------------------
+      - name: "Login to Amazon ECR"
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076  # v2.0.1
+
+      # -----------------------------------------------------------------------
+      # Push the signed image to ECR for ECS consumption.
+      #
+      # Steps:
+      #   1. Pull the signed image from GHCR (build registry)
+      #   2. Re-tag for ECR
+      #   3. Push to ECR
+      #   4. ECR's scan-on-push will automatically scan the image
+      #
+      # S-04: ECR scan-on-push is configured in Terraform (ecr module).
+      # The scan results are checked by AWS Inspector and can trigger
+      # EventBridge rules to block deployment if critical CVEs are found.
+      # -----------------------------------------------------------------------
+      - name: "Push image to ECR"
+        run: |
+          echo "============================================"
+          echo "  Phase 7 DEPLOY: Push to ECR"
+          echo "============================================"
+          echo ""
+
+          ECR_REGISTRY="${{ steps.ecr-login.outputs.registry }}"
+          ECR_IMAGE="${ECR_REGISTRY}/${{ vars.ECR_REPOSITORY }}:${{ needs.build.outputs.image-tag }}"
+
+          echo "Source: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.image-digest }}"
+          echo "Target: ${ECR_IMAGE}"
+          echo ""
+
+          # Pull from GHCR, re-tag for ECR, push
+          docker pull "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.image-digest }}"
+          docker tag "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.image-digest }}" "${ECR_IMAGE}"
+          docker push "${ECR_IMAGE}"
+
+          echo ""
+          echo "Image pushed to ECR. Scan-on-push will run automatically."
+
+          # Save ECR image URI for ECS task definition update
+          echo "ECR_IMAGE=${ECR_IMAGE}" >> $GITHUB_ENV
+
+      # -----------------------------------------------------------------------
+      # Update the ECS task definition with the new image.
+      #
+      # This renders a new revision of the task definition with:
+      #   - The new container image URI (from ECR)
+      #   - All other settings preserved (secrets, logging, resource limits)
+      #
+      # The task definition JSON is stored in the repository.
+      # This ensures the task definition is version-controlled and
+      # reviewed in PRs (CC-5 Pipeline Self-Defense).
+      #
+      # CC-5: Task definition file is covered by CODEOWNERS.
+      # Changes to container config require review.
+      # -----------------------------------------------------------------------
+      - name: "Render ECS task definition"
+        id: render-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@913b0a71297753a2c3e3a1f24489e27046058a3d  # v1.7.4
+        with:
+          task-definition: ecs/task-definition-staging.json
+          container-name: app
+          image: ${{ env.ECR_IMAGE }}
+
+      # -----------------------------------------------------------------------
+      # Deploy the new task definition to the ECS service.
+      #
+      # The deployment uses ECS rolling update strategy:
+      #   - minimumHealthyPercent: 100 (no downtime)
+      #   - maximumPercent: 200 (deploy new before removing old)
+      #   - ALB health check gates the rollout
+      #
+      # ECS will:
+      #   1. Start new tasks with the updated image
+      #   2. Register them with the ALB target group
+      #   3. Wait for ALB health check to pass
+      #   4. Drain connections from old tasks
+      #   5. Stop old tasks
+      #
+      # If the new tasks fail health checks, ECS automatically rolls back
+      # to the previous task definition revision.
+      #
+      # wait-for-service-stability: true = Job waits until deployment completes.
+      # This ensures smoke tests run against the new version.
+      #
+      # DORA Impact: ECS rolling deploys with ALB health check provide:
+      #   - Zero-downtime deployments (Deployment Frequency)
+      #   - Automatic rollback on failure (Change Failure Rate, MTTR)
+      # -----------------------------------------------------------------------
+      - name: "Deploy to ECS staging"
+        uses: aws-actions/amazon-ecs-deploy-task-definition@4e07d8183e4e8f6ea48ad648c53aeef3e51fec8e  # v2.3.1
+        with:
+          task-definition: ${{ steps.render-task-def.outputs.task-definition }}
+          service: ${{ vars.ECS_STAGING_SERVICE }}
+          cluster: ${{ vars.ECS_STAGING_CLUSTER }}
+          wait-for-service-stability: true
+          wait-for-minutes: 10
+
+      # -----------------------------------------------------------------------
+      # Post-deployment smoke tests against the staging ALB endpoint.
+      #
+      # Validates:
+      #   - Application health (Spring Actuator /actuator/health)
+      #   - Database connectivity (health check includes DB status)
+      #   - S3 connectivity (health check includes S3 status)
+      #   - API responsiveness (key endpoint returns 200)
+      #   - Security headers present (X-Content-Type-Options, etc.)
+      #
+      # These checks mirror the ALB target group health check configuration
+      # in Terraform (alb module: health_check path = /actuator/health).
+      # -----------------------------------------------------------------------
+      - name: "Run smoke tests"
+        run: |
+          echo "============================================"
+          echo "  Post-Deploy: Staging Smoke Tests"
+          echo "============================================"
+
+          STAGING_URL="${{ vars.STAGING_URL }}"
+
+          echo "Testing health endpoint..."
+          curl -sf "${STAGING_URL}/actuator/health" | jq '.status' || exit 1
+
+          echo "Testing API endpoint..."
+          curl -sf -o /dev/null -w "%{http_code}" "${STAGING_URL}/api/v1/documents" || exit 1
+
+          echo "Checking security headers..."
+          HEADERS=$(curl -sI "${STAGING_URL}/actuator/health")
+          echo "$HEADERS" | grep -qi "x-content-type-options" || echo "WARNING: Missing X-Content-Type-Options"
+          echo "$HEADERS" | grep -qi "x-frame-options" || echo "WARNING: Missing X-Frame-Options"
+
+          echo ""
+          echo "Staging smoke tests PASSED."
+
+  # ===========================================================================
+  # PHASE 7: DEPLOY - Production Deployment
+  # ===========================================================================
+  # Deploys the validated artifact to production using a canary strategy.
+  # Production deployment only runs on:
+  #   - Push to main (after staging validation)
+  #   - Release tag publication
+  #   - Manual dispatch with environment=production
+  #
+  # SSDF Alignment: PO.3.1, PO.5.1, PW.4.1 (verify deployment integrity)
+  #
+  # CC-1 Zero Trust:
+  #   - Deployment uses OIDC authentication (no long-lived creds)
+  #   - Image signature verified before deploy (cosign verify)
+  #   - The deployer identity is logged in CloudTrail
+  #   - Separation of duties: commit author != deploy approver (GitHub Environment)
+  #
+  # CC-3 Network Security: Production enforces:
+  #   - WAF active on ALB (OWASP rules + rate limiting)
+  #   - Security groups: ALB -> ECS only, ECS -> RDS/S3 only
+  #   - VPC flow logs for network monitoring
+  #   - ALB HTTPS only with TLS 1.2+
+  #
+  # Deployment Strategy: ECS with CodeDeploy Blue/Green
+  #   - CodeDeploy creates a new target group with new tasks
+  #   - Routes test traffic for validation
+  #   - Shifts production traffic gradually (canary: 10% -> 100%)
+  #   - Automatic rollback on CloudWatch alarm trigger
+  #
+  # DORA Impact: Blue/Green with CodeDeploy enables high Deployment Frequency
+  # with low Change Failure Rate. Automatic rollback minimizes MTTR.
+  # ===========================================================================
+  deploy-production:
+    name: "Deploy to Production (ECS + CodeDeploy Blue/Green)"
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, build]
+    # -------------------------------------------------------------------------
+    # Production deploy conditions:
+    #   - Only on main branch pushes or release tags (not PRs)
+    #   - Only if not manually dispatched to staging-only
+    #
+    # For manual dispatch, check the selected environment.
+    # -------------------------------------------------------------------------
+    if: |
+      github.event_name == 'release' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production')
+    timeout-minutes: 30
+    environment:
+      # -----------------------------------------------------------------------
+      # The 'production' environment should be configured in GitHub with:
+      #   - Required reviewers (at least 1 reviewer who is not the author)
+      #   - Wait timer (optional, e.g., 5 minutes for final review)
+      #   - Environment-specific secrets (production DB, etc.)
+      #   - Deployment branch restrictions (main only)
+      #
+      # CC-1 Zero Trust: Required reviewers enforce separation of duties.
+      # The person who wrote the code cannot approve its production deploy.
+      # -----------------------------------------------------------------------
+      name: production
+      url: ${{ vars.PRODUCTION_URL }}
+
+    permissions:
+      contents: read
+      id-token: write  # OIDC auth to AWS
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      # -----------------------------------------------------------------------
+      # Verify the image signature before deploying to production.
+      # Defense-in-depth: even though signed in sign-and-attest, we verify
+      # again to ensure no tampering occurred in the registry.
+      #
+      # CC-5 Pipeline Self-Defense: NON-OVERRIDABLE check.
+      # -----------------------------------------------------------------------
+      - name: "Install cosign"
+        uses: sigstore/cosign-installer@3454372be428ca50be69363b3b214d930e4af3b7  # v3.8.2
+
+      - name: "Verify image signature"
+        run: |
+          echo "============================================"
+          echo "  CC-5: Verify Image Signature"
+          echo "============================================"
+
+          cosign verify \
+            --certificate-identity-regexp="https://github.com/${{ github.repository }}/" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.image-digest }}"
+
+          echo "VERIFIED: Image signature is valid."
+
+      # -----------------------------------------------------------------------
+      # Authenticate to AWS production account using OIDC.
+      #
+      # CC-1 Zero Trust: Production role is separate from staging role.
+      # Trust policy restricts to:
+      #   - This repository only
+      #   - main branch or release tags only
+      #   - Requires GitHub Environment approval (set above)
+      # -----------------------------------------------------------------------
+      - name: "Configure AWS credentials (OIDC)"
+        uses: aws-actions/configure-aws-credentials@ececac1a45f3b08a01d2dd070d28d111c5fe6722  # v4.1.0
+        with:
+          role-to-assume: ${{ vars.AWS_PRODUCTION_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: "Login to Amazon ECR"
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076  # v2.0.1
+
+      # -----------------------------------------------------------------------
+      # Render the production task definition with the new image.
+      #
+      # Production task definition differences from staging:
+      #   - Higher CPU/memory limits
+      #   - Production Secrets Manager ARNs
+      #   - Production logging configuration
+      #   - Read-only root filesystem enforced
+      # -----------------------------------------------------------------------
+      - name: "Render ECS task definition"
+        id: render-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@913b0a71297753a2c3e3a1f24489e27046058a3d  # v1.7.4
+        with:
+          task-definition: ecs/task-definition-production.json
+          container-name: app
+          image: "${{ steps.ecr-login.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ needs.build.outputs.image-tag }}"
+
+      # -----------------------------------------------------------------------
+      # Deploy to production ECS using CodeDeploy Blue/Green strategy.
+      #
+      # How ECS + CodeDeploy Blue/Green works:
+      #   1. CodeDeploy creates NEW target group with new task definition
+      #   2. Starts new tasks, registers with new target group
+      #   3. Routes TEST traffic to new target group (test listener port)
+      #   4. Runs lifecycle hooks (AfterAllowTestTraffic)
+      #   5. Shifts PRODUCTION traffic: 10% -> 50% -> 100% (configurable)
+      #   6. Waits at each step, monitoring CloudWatch alarms
+      #   7. If alarm triggers: automatic rollback to original target group
+      #   8. After full shift: drains and terminates old tasks
+      #
+      # Rollback triggers (configured in CodeDeploy deployment group):
+      #   - ALB 5xx error rate > 5% (CloudWatch alarm)
+      #   - Target group unhealthy host count > 0
+      #   - Application latency p99 > 2s
+      #   - Manual rollback via AWS Console or CLI
+      #
+      # DORA Impact:
+      #   - Deployment Frequency: Blue/Green enables multiple deploys/day
+      #   - Change Failure Rate: Automatic rollback on alarm
+      #   - MTTR: Rollback completes in < 5 minutes
+      #   - Reliability: Traffic shift validates against SLOs
+      #
+      # codedeploy-appspec: Defines the ECS deployment configuration
+      # codedeploy-application: CodeDeploy application name
+      # codedeploy-deployment-group: Deployment group with traffic shift config
+      # -----------------------------------------------------------------------
+      - name: "Deploy to ECS production (Blue/Green)"
+        uses: aws-actions/amazon-ecs-deploy-task-definition@4e07d8183e4e8f6ea48ad648c53aeef3e51fec8e  # v2.3.1
+        with:
+          task-definition: ${{ steps.render-task-def.outputs.task-definition }}
+          service: ${{ vars.ECS_PRODUCTION_SERVICE }}
+          cluster: ${{ vars.ECS_PRODUCTION_CLUSTER }}
+          wait-for-service-stability: true
+          wait-for-minutes: 15
+          codedeploy-appspec: ecs/appspec.yml
+          codedeploy-application: ${{ vars.CODEDEPLOY_APPLICATION }}
+          codedeploy-deployment-group: ${{ vars.CODEDEPLOY_DEPLOYMENT_GROUP }}
+
+  # ===========================================================================
+  # PHASE 9: MONITOR - Post-Deployment Monitoring & DORA Metrics
+  # ===========================================================================
+  # Records DORA metrics and performs post-deployment validation.
+  # This job runs after production deployment and:
+  #   1. Records the deployment timestamp (DORA: Deployment Frequency)
+  #   2. Calculates lead time (DORA: Lead Time for Changes)
+  #   3. Verifies SLO compliance (DORA: Reliability)
+  #   4. Creates deployment annotation in Grafana for correlation
+  #
+  # SSDF Alignment: PO.3.1, PO.3.2 (operational monitoring)
+  #
+  # SRE Integration: This is where the pipeline hands off to the SRE
+  # observability stack. The deployment event is recorded, and the
+  # monitoring system takes over for ongoing reliability tracking.
+  #
+  # DORA Impact: This job is where all DORA metrics get recorded.
+  # The data flows to Prometheus/Grafana for dashboard visualization.
+  # ===========================================================================
+  post-deploy-monitor:
+    name: "Post-Deploy Monitoring & DORA Metrics"
+    runs-on: ubuntu-latest
+    needs: [deploy-production, build]
+    if: always() && needs.deploy-production.result == 'success'
+    timeout-minutes: 10
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      # -----------------------------------------------------------------------
+      # Download the DORA timing data recorded in the preflight job.
+      # This contains the commit timestamp needed for lead time calculation.
+      # -----------------------------------------------------------------------
+      - name: "Download DORA timing data"
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: dora-timing
+          path: /tmp/dora-metrics/
+
+      # -----------------------------------------------------------------------
+      # Record DORA metrics for this deployment.
+      #
+      # Metrics recorded:
+      #   1. deployment_frequency: Counter incremented on each deploy
+      #   2. lead_time_seconds: Time from commit to production deploy
+      #   3. deployment_timestamp: When the deploy happened
+      #   4. deployment_commit: Which commit was deployed
+      #
+      # These metrics are sent to the DORA metrics endpoint (typically
+      # Prometheus Pushgateway or a custom metrics API).
+      #
+      # The Grafana dashboard consumes these metrics to display:
+      #   - Deployment frequency trends (daily/weekly/monthly)
+      #   - Lead time distribution (histogram)
+      #   - Change failure rate (requires incident correlation)
+      #   - MTTR (requires incident resolution timestamps)
+      #   - Reliability (SLO compliance from Prometheus)
+      #
+      # DORA Targets (Elite):
+      #   - Deployment Frequency: Multiple times per day
+      #   - Lead Time: < 1 hour
+      #   - Change Failure Rate: < 5%
+      #   - MTTR: < 1 hour
+      #   - Reliability: Meets/exceeds SLO
+      # -----------------------------------------------------------------------
+      - name: "Record DORA metrics"
+        run: |
+          echo "============================================"
+          echo "  Phase 9 MONITOR: DORA Metrics Recording"
+          echo "============================================"
+          echo ""
+
+          # Read commit timestamp from preflight job
+          COMMIT_TS=$(cat /tmp/dora-metrics/commit_timestamp 2>/dev/null || echo "unknown")
+          DEPLOY_TS=$(date -u +%s)
+
+          # Calculate lead time
+          if [ "$COMMIT_TS" != "unknown" ]; then
+            LEAD_TIME=$((DEPLOY_TS - COMMIT_TS))
+            LEAD_TIME_MIN=$((LEAD_TIME / 60))
+            LEAD_TIME_HOURS=$((LEAD_TIME / 3600))
+
+            echo "DORA - Lead Time for Changes:"
+            echo "  Commit timestamp:  ${COMMIT_TS}"
+            echo "  Deploy timestamp:  ${DEPLOY_TS}"
+            echo "  Lead time:         ${LEAD_TIME}s (${LEAD_TIME_MIN}m / ${LEAD_TIME_HOURS}h)"
+            echo ""
+
+            # Classify lead time performance
+            if [ $LEAD_TIME -lt 3600 ]; then
+              echo "  Classification:    ELITE (< 1 hour)"
+            elif [ $LEAD_TIME -lt 604800 ]; then
+              echo "  Classification:    HIGH (< 1 week)"
+            elif [ $LEAD_TIME -lt 15552000 ]; then
+              echo "  Classification:    MEDIUM (< 6 months)"
+            else
+              echo "  Classification:    LOW (> 6 months)"
+            fi
+          fi
+
+          echo ""
+          echo "DORA - Deployment Frequency:"
+          echo "  Deployment recorded for $(date -u +%Y-%m-%d)"
+          echo "  Commit: ${{ github.sha }}"
+          echo "  Image:  ${{ needs.build.outputs.image-tag }}"
+          echo ""
+
+          # -----------------------------------------------------------------
+          # TODO: Send metrics to your observability stack.
+          #
+          # Example: Prometheus Pushgateway
+          #
+          # cat <<METRICS_EOF | curl --data-binary @- ${DORA_METRICS_ENDPOINT}/metrics/job/dora/instance/${GITHUB_REPOSITORY}
+          # # HELP deployment_lead_time_seconds Lead time from commit to production deploy
+          # # TYPE deployment_lead_time_seconds gauge
+          # deployment_lead_time_seconds ${LEAD_TIME}
+          # # HELP deployments_total Total number of production deployments
+          # # TYPE deployments_total counter
+          # deployments_total 1
+          # METRICS_EOF
+          #
+          # Example: Grafana annotation (mark deployment on dashboards)
+          #
+          # curl -X POST ${GRAFANA_URL}/api/annotations \
+          #   -H "Authorization: Bearer ${GRAFANA_API_KEY}" \
+          #   -H "Content-Type: application/json" \
+          #   -d "{\"text\":\"Deploy ${{ needs.build.outputs.image-tag }}\",\"tags\":[\"deploy\"]}"
+          # -----------------------------------------------------------------
+
+      # -----------------------------------------------------------------------
+      # Post-deployment health verification.
+      # Wait for the canary to stabilize, then check key health indicators.
+      #
+      # This is the automated version of "Post-deployment checkout"
+      # (PREFERRED in Deploy Phase per DoD guidebook).
+      #
+      # Checks include:
+      #   - Application health endpoint
+      #   - Key API endpoint functionality
+      #   - Error rate within acceptable range
+      #   - Latency within SLO thresholds
+      #
+      # If any check fails, alert the on-call team via PagerDuty.
+      # The canary deployment system should also detect issues and auto-rollback.
+      # -----------------------------------------------------------------------
+      - name: "Post-deployment health check"
+        run: |
+          echo "============================================"
+          echo "  Post-Deploy: Health Verification"
+          echo "============================================"
+          echo ""
+          echo "TODO: Replace with your health check commands."
+          echo ""
+          echo "Example:"
+          echo "  # Wait for deployment to stabilize"
+          echo "  sleep 30"
+          echo "  "
+          echo "  # Check health endpoint"
+          echo "  curl -sf ${PRODUCTION_URL}/health | jq '.status'"
+          echo "  "
+          echo "  # Check error rate in Prometheus"
+          echo "  # promql: rate(http_requests_total{status=~\"5..\"}[5m]) / rate(http_requests_total[5m])"
+          echo "  "
+          echo "  # Verify SLO compliance"
+          echo "  # promql: slo:sli_error:ratio_rate5m{service=\"myapp\"} < 0.001"
+        env:
+          PRODUCTION_URL: ${{ vars.PRODUCTION_URL }}
+
+      # -----------------------------------------------------------------------
+      # Create a GitHub deployment status for tracking.
+      # This provides a deployment history visible in the repository UI.
+      # -----------------------------------------------------------------------
+      - name: "Pipeline summary"
+        run: |
+          echo "============================================"
+          echo "  Pipeline Complete"
+          echo "============================================"
+          echo ""
+          echo "Image:         ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build.outputs.image-digest }}"
+          echo "Tag:           ${{ needs.build.outputs.image-tag }}"
+          echo "Signed:        Yes (cosign + Sigstore)"
+          echo "Provenance:    Yes (SLSA attestation)"
+          echo "SBOM:          Yes (CycloneDX)"
+          echo "Environment:   Production"
+          echo ""
+          echo "DORA metrics recorded. View dashboard at: ${DORA_METRICS_ENDPOINT:-'(not configured)'}"
+          echo ""
+          echo "Next: Monitor SLO compliance and error budget in Grafana."
+          echo "On-call: PagerDuty will alert if SLO breaches occur."

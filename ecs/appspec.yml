@@ -1,0 +1,28 @@
+version: 0.0
+
+# =============================================================================
+# AWS CodeDeploy AppSpec for ECS Blue/Green Deployment
+# =============================================================================
+# This file tells CodeDeploy how to perform the blue/green deployment:
+#   1. Which ECS resources to manage
+#   2. How to shift traffic between target groups
+#   3. Which lifecycle hooks to run for validation
+#
+# Traffic shift configuration is set in the CodeDeploy Deployment Group
+# (Terraform: codedeploy module), not in this file.
+#
+# Typical traffic shift config:
+#   - Linear10PercentEvery1Minute  (safe, takes 10 minutes)
+#   - Canary10Percent5Minutes      (10% for 5 min, then 100%)
+#   - AllAtOnce                    (fast but risky)
+# =============================================================================
+
+Resources:
+  - TargetService:
+      Type: AWS::ECS::Service
+      Properties:
+        TaskDefinition: <TASK_DEFINITION>
+        LoadBalancerInfo:
+          ContainerName: "app"
+          ContainerPort: 8080
+        PlatformVersion: "LATEST"

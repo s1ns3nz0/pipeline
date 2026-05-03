@@ -1,0 +1,51 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_NAME: documents_e2e
+      DB_USERNAME: app
+      DB_PASSWORD: ${DB_PASSWORD:-e2e-test-password}
+      S3_BUCKET: documents-e2e
+      S3_ENDPOINT: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      API_KEY: ${API_KEY:-e2e-test-api-key}
+      SPRING_JPA_HIBERNATE_DDL_AUTO: create-drop
+    depends_on:
+      mysql:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-e2e-root-password}
+      MYSQL_DATABASE: documents_e2e
+      MYSQL_USER: app
+      MYSQL_PASSWORD: ${DB_PASSWORD:-e2e-test-password}
+    tmpfs:
+      - /var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  localstack:
+    image: localstack/localstack:3.5
+    environment:
+      SERVICES: s3
+      DEFAULT_REGION: us-east-1
+    tmpfs:
+      - /var/lib/localstack
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
