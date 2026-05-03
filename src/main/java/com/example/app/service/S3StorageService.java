@@ -9,6 +9,8 @@ import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectResponse;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 
+import org.springframework.beans.factory.annotation.Value;
+
 import java.io.InputStream;
 
 @Service
@@ -18,7 +20,7 @@ public class S3StorageService {
     private final String bucket;
 
     public S3StorageService(S3Client s3Client,
-                            org.springframework.beans.factory.annotation.Value("${app.s3.bucket}") String bucket) {
+                            @Value("${app.s3.bucket}") String bucket) {
         this.s3Client = s3Client;
         this.bucket = bucket;
     }
