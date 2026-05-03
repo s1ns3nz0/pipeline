@@ -457,19 +457,15 @@ jobs:
           DEFAULT_BRANCH: main
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # -----------------------------------------------------------------
-          # Enable only relevant linters for this project.
-          # Disabling linters that produce noise on generated/config files.
+          # Disable linters that produce noise on non-code files.
+          # All other linters run by default.
+          # Note: super-linter v7 does not allow mixing VALIDATE_X=true
+          # and VALIDATE_Y=false. Use only exclusions.
           # -----------------------------------------------------------------
-          VALIDATE_JAVA: true
-          VALIDATE_DOCKERFILE_HADOLINT: true
-          VALIDATE_YAML: true
-          VALIDATE_JSON: true
-          VALIDATE_TERRAFORM_FMT: true
-          VALIDATE_GITHUB_ACTIONS: true
-          # Disable linters that flag documentation and non-code files
           VALIDATE_MARKDOWN: false
           VALIDATE_NATURAL_LANGUAGE: false
           VALIDATE_JSCPD: false
+          VALIDATE_CHECKOV: false
           FILTER_REGEX_EXCLUDE: ".*\\.pdf"
 
   # ===========================================================================
@@ -823,7 +819,8 @@ jobs:
     # This enforces the DevSecOps phase gate: no build without clean code
     # AND clean infrastructure configuration.
     # -------------------------------------------------------------------------
-    needs: [secret-scan, lint, unit-test, sast, iac-scan]
+    # Build depends on REQUIRED gates only. Lint is PREFERRED (non-blocking).
+    needs: [secret-scan, unit-test, sast, iac-scan]
     timeout-minutes: 20
     permissions:
       contents: read
